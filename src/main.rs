@@ -13,17 +13,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    New {
-        name: String,
-    },
-    Apply {
-        name: String,
-    },
+    New { name: String },
+    Apply { name: String },
     List,
     Status,
-    Delete {
-        name: String,
-    },
+    Delete { name: String },
 }
 
 fn main() {
