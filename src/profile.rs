@@ -1,8 +1,8 @@
-se crate::config;
+use crate::config::{self, ProfileEntry};
 use colored::Colorize;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -16,11 +16,8 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn profile_copy_path(profile: &str, original: &Path) -> PathBuf {
-    let flat = original
-        .to_string_lossy()
-        .replace('/', "%");
-    config::profiles_dir().join(profile).join(flat)
+fn stored_path(profile: &str, alias: &str) -> PathBuf {
+    config::profiles_dir().join(profile).join(alias)
 }
 
 fn prompt(msg: &str) -> String {
@@ -29,6 +26,13 @@ fn prompt(msg: &str) -> String {
     let mut buf = String::new();
     io::stdin().read_line(&mut buf).unwrap();
     buf.trim().to_string()
+}
+
+fn default_alias(path: &std::path::Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn create(name: &str) -> anyhow::Result<()> {
@@ -41,7 +45,7 @@ pub fn create(name: &str) -> anyhow::Result<()> {
     println!("{} {}", "Creating profile".bold(), name.cyan().bold());
     println!("Enter config file paths one at a time. Press {} to finish.\n", "Enter".dimmed());
 
-    let mut files: Vec<String> = Vec::new();
+    let mut entries: Vec<ProfileEntry> = Vec::new();
 
     loop {
         let input = prompt(&format!("  {} ", "add file:".dimmed()));
@@ -56,27 +60,43 @@ pub fn create(name: &str) -> anyhow::Result<()> {
             continue;
         }
 
-        let dest = profile_copy_path(name, &expanded);
+        let suggested = default_alias(&expanded);
+        let alias_input = prompt(&format!(
+            "  {} [{}]: ",
+            "profile name".dimmed(),
+            suggested.dimmed()
+        ));
+        let alias = if alias_input.is_empty() {
+            suggested
+        } else {
+            alias_input
+        };
+
+        let dest = stored_path(name, &alias);
         fs::create_dir_all(dest.parent().unwrap())?;
         fs::copy(&expanded, &dest)?;
 
-        files.push(expanded.to_string_lossy().into_owned());
-        println!("  {} {}", "✓".green(), expanded.display());
+        println!("  {} saved as {}\n", "✓".green(), alias.cyan());
+
+        entries.push(ProfileEntry {
+            original: expanded.to_string_lossy().into_owned(),
+            alias,
+        });
     }
 
-    if files.is_empty() {
+    if entries.is_empty() {
         println!("\n{} no files added, profile not saved.", "!".yellow());
         return Ok(());
     }
 
-    cfg.profiles.insert(name.to_string(), files.clone());
+    cfg.profiles.insert(name.to_string(), entries.clone());
     config::save(&cfg)?;
 
     println!(
         "\n{} profile {} saved with {} file(s). Run {} to activate.",
         "✓".green().bold(),
         name.cyan().bold(),
-        files.len(),
+        entries.len(),
         format!("onf apply {}", name).bold()
     );
     Ok(())
@@ -85,7 +105,7 @@ pub fn create(name: &str) -> anyhow::Result<()> {
 pub fn apply(name: &str) -> anyhow::Result<()> {
     let mut cfg = config::load()?;
 
-    let files = cfg
+    let entries = cfg
         .profiles
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("no profile named \"{}\"", name))?
@@ -93,12 +113,12 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
 
     println!("{} {}\n", "Applying profile".bold(), name.cyan().bold());
 
-    for original_str in &files {
-        let original = PathBuf::from(original_str);
-        let stored = profile_copy_path(name, &original);
+    for entry in &entries {
+        let original = PathBuf::from(&entry.original);
+        let stored = stored_path(name, &entry.alias);
 
         if !stored.exists() {
-            println!("  {} stored copy missing for {}, skipping", "⚠".yellow(), original.display());
+            println!("  {} stored copy missing for {}, skipping", "⚠".yellow(), entry.alias);
             continue;
         }
 
@@ -116,7 +136,13 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&stored, &original)?;
 
-        println!("  {} {} {} {}", "→".blue(), stored.display(), "→".dimmed(), original.display());
+        println!(
+            "  {} {} {} {}",
+            "→".blue(),
+            entry.alias.cyan(),
+            "→".dimmed(),
+            original.display()
+        );
     }
 
     cfg.active = Some(name.to_string());
@@ -135,15 +161,15 @@ pub fn list() -> anyhow::Result<()> {
     }
 
     println!("{}\n", "Profiles:".bold());
-    for (profile_name, files) in &cfg.profiles {
+    for (profile_name, entries) in &cfg.profiles {
         let active_marker = if cfg.active.as_deref() == Some(profile_name) {
             format!(" {}", "(active)".green())
         } else {
             String::new()
         };
         println!("  {}{}", profile_name.cyan().bold(), active_marker);
-        for f in files {
-            println!("    {}", f.dimmed());
+        for e in entries {
+            println!("    {} {} {}", e.alias.cyan(), "→".dimmed(), e.original.dimmed());
         }
     }
     Ok(())
@@ -155,9 +181,9 @@ pub fn status() -> anyhow::Result<()> {
     match &cfg.active {
         Some(name) => {
             println!("{} {}", "Active profile:".bold(), name.cyan().bold());
-            if let Some(files) = cfg.profiles.get(name) {
-                for f in files {
-                    println!("  {}", f.dimmed());
+            if let Some(entries) = cfg.profiles.get(name) {
+                for e in entries {
+                    println!("  {} {} {}", e.alias.cyan(), "→".dimmed(), e.original.dimmed());
                 }
             }
         }
