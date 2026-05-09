@@ -3,10 +3,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProfileEntry {
+    pub original: String,
+    pub alias: String,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     pub active: Option<String>,
-    pub profiles: HashMap<String, Vec<String>>,
+    pub profiles: HashMap<String, Vec<ProfileEntry>>,
 }
 
 pub fn config_dir() -> PathBuf {
