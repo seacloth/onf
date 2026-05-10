@@ -1,8 +1,9 @@
-use crate::config::{self, ProfileEntry};
+use crate::config::{self, ProfileEntry, ProfileHooks};
 use colored::Colorize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Command;
 
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -35,18 +36,7 @@ fn default_alias(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-pub fn create(name: &str) -> anyhow::Result<()> {
-    let mut cfg = config::load()?;
-
-    if cfg.profiles.contains_key(name) {
-        anyhow::bail!("profile \"{}\" already exists", name);
-    }
-
-    println!("{} {}", "Creating profile".bold(), name.cyan().bold());
-    println!("Enter config file paths one at a time. Press {} to finish.\n", "Enter".dimmed());
-
-    let mut entries: Vec<ProfileEntry> = Vec::new();
-
+fn add_file(name: &str, entries: &mut Vec<ProfileEntry>) -> anyhow::Result<()> {
     loop {
         let input = prompt(&format!("  {} ", "add file:".dimmed()));
         if input.is_empty() {
@@ -83,13 +73,56 @@ pub fn create(name: &str) -> anyhow::Result<()> {
             alias,
         });
     }
+    Ok(())
+}
+
+fn run_hooks(hooks: &ProfileHooks) {
+    if let Some(cmds) = &hooks.post_apply {
+        println!("\n{}", "Running hooks:".bold());
+        for cmd in cmds {
+            println!("  {} {}", "$".dimmed(), cmd.cyan());
+            let status = Command::new("sh").arg("-c").arg(cmd).status();
+            match status {
+                Ok(s) if s.success() => println!("  {}", "✓".green()),
+                Ok(s) => println!("  {} exited with {}", "⚠".yellow(), s),
+                Err(e) => println!("  {} failed to run: {}", "✗".red(), e),
+            }
+        }
+    }
+}
+
+pub fn create(name: &str) -> anyhow::Result<()> {
+    let mut cfg = config::load()?;
+
+    if cfg.profiles.contains_key(name) {
+        anyhow::bail!("profile \"{}\" already exists", name);
+    }
+
+    println!("{} {}", "Creating profile".bold(), name.cyan().bold());
+    println!("Enter config file paths one at a time. Press {} to finish.\n", "Enter".dimmed());
+
+    let mut entries: Vec<ProfileEntry> = Vec::new();
+    add_file(name, &mut entries)?;
 
     if entries.is_empty() {
         println!("\n{} no files added, profile not saved.", "!".yellow());
         return Ok(());
     }
 
+    println!("\n{}", "Add post-apply hooks (commands to run after applying). Press Enter to finish.".dimmed());
+    let mut hooks: Vec<String> = Vec::new();
+    loop {
+        let cmd = prompt(&format!("  {} ", "command:".dimmed()));
+        if cmd.is_empty() {
+            break;
+        }
+        hooks.push(cmd);
+    }
+
     cfg.profiles.insert(name.to_string(), entries.clone());
+    if !hooks.is_empty() {
+        cfg.hooks.insert(name.to_string(), ProfileHooks { post_apply: Some(hooks) });
+    }
     config::save(&cfg)?;
 
     println!(
@@ -110,6 +143,8 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("no profile named \"{}\"", name))?
         .clone();
+
+    let hooks = cfg.hooks.get(name).cloned().unwrap_or_default();
 
     println!("{} {}\n", "Applying profile".bold(), name.cyan().bold());
 
@@ -149,6 +184,131 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
     config::save(&cfg)?;
 
     println!("\n{} active profile is now {}", "✓".green().bold(), name.cyan().bold());
+
+    run_hooks(&hooks);
+
+    Ok(())
+}
+
+pub fn edit(name: &str) -> anyhow::Result<()> {
+    let mut cfg = config::load()?;
+
+    if !cfg.profiles.contains_key(name) {
+        anyhow::bail!("no profile named \"{}\"", name);
+    }
+
+    loop {
+        println!("\n{} {}\n", "Editing profile".bold(), name.cyan().bold());
+        println!("  {} add a file", "[1]".cyan());
+        println!("  {} remove a file", "[2]".cyan());
+        println!("  {} rename profile", "[3]".cyan());
+        println!("  {} manage hooks", "[4]".cyan());
+        println!("  {} quit\n", "[q]".dimmed());
+
+        let choice = prompt(&format!("{} ", ">".dimmed()));
+
+        match choice.as_str() {
+            "1" => {
+                let entries = cfg.profiles.get_mut(name).unwrap();
+                add_file(name, entries)?;
+                config::save(&cfg)?;
+            }
+            "2" => {
+                let entries = cfg.profiles.get(name).unwrap().clone();
+                if entries.is_empty() {
+                    println!("  {} no files in this profile", "!".yellow());
+                    continue;
+                }
+                println!();
+                for (i, e) in entries.iter().enumerate() {
+                    println!("  [{}] {} {} {}", i + 1, e.alias.cyan(), "→".dimmed(), e.original.dimmed());
+                }
+                let input = prompt("\n  remove #: ");
+                if let Ok(n) = input.parse::<usize>() {
+                    if n >= 1 && n <= entries.len() {
+                        let removed = cfg.profiles.get_mut(name).unwrap().remove(n - 1);
+                        let stored = stored_path(name, &removed.alias);
+                        if stored.exists() {
+                            fs::remove_file(&stored)?;
+                        }
+                        println!("  {} removed {}", "✓".green(), removed.alias.cyan());
+                        config::save(&cfg)?;
+                    } else {
+                        println!("  {} invalid number", "⚠".yellow());
+                    }
+                }
+            }
+            "3" => {
+                let new_name = prompt(&format!("  new name [{}]: ", name.cyan()));
+                if new_name.is_empty() || new_name == name {
+                    continue;
+                }
+                if cfg.profiles.contains_key(&new_name) {
+                    println!("  {} profile \"{}\" already exists", "⚠".yellow(), new_name);
+                    continue;
+                }
+                let entries = cfg.profiles.remove(name).unwrap();
+                let hooks = cfg.hooks.remove(name);
+                let profile_dir = config::profiles_dir().join(name);
+                let new_profile_dir = config::profiles_dir().join(&new_name);
+                if profile_dir.exists() {
+                    fs::rename(&profile_dir, &new_profile_dir)?;
+                }
+                cfg.profiles.insert(new_name.clone(), entries);
+                if let Some(h) = hooks {
+                    cfg.hooks.insert(new_name.clone(), h);
+                }
+                if cfg.active.as_deref() == Some(name) {
+                    cfg.active = Some(new_name.clone());
+                }
+                config::save(&cfg)?;
+                println!("  {} renamed to {}", "✓".green(), new_name.cyan());
+                break;
+            }
+            "4" => {
+                let hooks = cfg.hooks.entry(name.to_string()).or_default();
+                let existing = hooks.post_apply.clone().unwrap_or_default();
+                println!("\n  {} post-apply hooks:", "current".dimmed());
+                if existing.is_empty() {
+                    println!("  {}", "none".dimmed());
+                } else {
+                    for (i, cmd) in existing.iter().enumerate() {
+                        println!("  [{}] {}", i + 1, cmd.cyan());
+                    }
+                }
+                println!("\n  {} add  {} remove #  {} clear", "[a]".cyan(), "[r]".cyan(), "[c]".cyan());
+                let action = prompt(&format!("  {} ", ">".dimmed()));
+                match action.as_str() {
+                    "a" => {
+                        let cmd = prompt("  command: ");
+                        if !cmd.is_empty() {
+                            hooks.post_apply.get_or_insert_with(Vec::new).push(cmd.clone());
+                            println!("  {} added: {}", "✓".green(), cmd.cyan());
+                        }
+                    }
+                    "c" => {
+                        hooks.post_apply = None;
+                        println!("  {} hooks cleared", "✓".green());
+                    }
+                    s if s.starts_with('r') => {
+                        let n: usize = s[1..].trim().parse().unwrap_or(0);
+                        let cmds = hooks.post_apply.get_or_insert_with(Vec::new);
+                        if n >= 1 && n <= cmds.len() {
+                            let removed = cmds.remove(n - 1);
+                            println!("  {} removed: {}", "✓".green(), removed.cyan());
+                        } else {
+                            println!("  {} invalid number", "⚠".yellow());
+                        }
+                    }
+                    _ => {}
+                }
+                config::save(&cfg)?;
+            }
+            "q" | "" => break,
+            _ => println!("  {} unknown option", "⚠".yellow()),
+        }
+    }
+
     Ok(())
 }
 
@@ -170,6 +330,13 @@ pub fn list() -> anyhow::Result<()> {
         println!("  {}{}", profile_name.cyan().bold(), active_marker);
         for e in entries {
             println!("    {} {} {}", e.alias.cyan(), "→".dimmed(), e.original.dimmed());
+        }
+        if let Some(hooks) = cfg.hooks.get(profile_name) {
+            if let Some(cmds) = &hooks.post_apply {
+                for cmd in cmds {
+                    println!("    {} {}", "hook:".dimmed(), cmd.dimmed());
+                }
+            }
         }
     }
     Ok(())
@@ -215,6 +382,7 @@ pub fn delete(name: &str) -> anyhow::Result<()> {
     }
 
     cfg.profiles.remove(name);
+    cfg.hooks.remove(name);
     if cfg.active.as_deref() == Some(name) {
         cfg.active = None;
     }
