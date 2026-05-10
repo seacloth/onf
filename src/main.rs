@@ -15,6 +15,7 @@ struct Cli {
 enum Commands {
     New { name: String },
     Apply { name: String },
+    Edit { name: String },
     List,
     Status,
     Delete { name: String },
@@ -26,6 +27,7 @@ fn main() {
     let result = match cli.command {
         Commands::New { name } => profile::create(&name),
         Commands::Apply { name } => profile::apply(&name),
+        Commands::Edit { name } => profile::edit(&name),
         Commands::List => profile::list(),
         Commands::Status => profile::status(),
         Commands::Delete { name } => profile::delete(&name),
