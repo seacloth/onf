@@ -6,6 +6,10 @@ onf is a minimal configuration switcher written in Rust.
 
 ---
 
+> onf is updated quite regularly since its a personal project!
+
+---
+
 ### install
 
 ```bash
