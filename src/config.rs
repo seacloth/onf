@@ -18,6 +18,7 @@ pub struct ProfileHooks {
 pub struct Config {
     pub active: Option<String>,
     pub profiles: HashMap<String, Vec<ProfileEntry>>,
+    #[serde(default)]
     pub hooks: HashMap<String, ProfileHooks>,
 }
 
