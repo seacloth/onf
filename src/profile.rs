@@ -55,7 +55,7 @@ pub fn create(name: &str) -> anyhow::Result<()> {
 
         let expanded = expand_tilde(&input);
 
-        if !expanded.exists() {
+        if expanded.symlink_metadata().is_err() {
             println!("  {} file not found, skipping: {}", "⚠".yellow(), expanded.display());
             continue;
         }
