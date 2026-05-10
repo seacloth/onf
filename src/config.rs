@@ -9,10 +9,16 @@ pub struct ProfileEntry {
     pub alias: String,
 }
 
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct ProfileHooks {
+    pub post_apply: Option<Vec<String>>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     pub active: Option<String>,
     pub profiles: HashMap<String, Vec<ProfileEntry>>,
+    pub hooks: HashMap<String, ProfileHooks>,
 }
 
 pub fn config_dir() -> PathBuf {
