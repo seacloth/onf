@@ -1,9 +1,13 @@
-use crate::config::{self, ProfileEntry, ProfileHooks};
+use crate::config::{self, Config, ProfileEntry, ProfileHooks};
 use colored::Colorize;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use tar::Archive;
 
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -135,7 +139,7 @@ pub fn create(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn apply(name: &str) -> anyhow::Result<()> {
+pub fn apply(name: &str, dry_run: bool) -> anyhow::Result<()> {
     let mut cfg = config::load()?;
 
     let entries = cfg
@@ -146,7 +150,11 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
 
     let hooks = cfg.hooks.get(name).cloned().unwrap_or_default();
 
-    println!("{} {}\n", "Applying profile".bold(), name.cyan().bold());
+    if dry_run {
+        println!("{} {}\n", "Dry run — apply".bold(), name.cyan().bold());
+    } else {
+        println!("{} {}\n", "Applying profile".bold(), name.cyan().bold());
+    }
 
     for entry in &entries {
         let original = PathBuf::from(&entry.original);
@@ -157,20 +165,6 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
             continue;
         }
 
-        if original.exists() || original.symlink_metadata().is_ok() {
-            fs::remove_file(&original)?;
-        }
-
-        if let Some(parent) = original.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&stored, &original)?;
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&stored, &original)?;
-
         println!(
             "  {} {} {} {}",
             "→".blue(),
@@ -178,14 +172,260 @@ pub fn apply(name: &str) -> anyhow::Result<()> {
             "→".dimmed(),
             original.display()
         );
+
+        if dry_run {
+            continue;
+        }
+
+        if let Some(parent) = original.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp = original.with_extension("onf_tmp");
+        if original.exists() || original.symlink_metadata().is_ok() {
+            fs::rename(&original, &tmp)?;
+        }
+
+        let result = {
+            #[cfg(unix)]
+            { std::os::unix::fs::symlink(&stored, &original) }
+            #[cfg(windows)]
+            { std::os::windows::fs::symlink_file(&stored, &original) }
+        };
+
+        match result {
+            Ok(_) => {
+                if tmp.exists() {
+                    fs::remove_file(&tmp)?;
+                }
+            }
+            Err(e) => {
+                if tmp.exists() {
+                    fs::rename(&tmp, &original)?;
+                }
+                return Err(e.into());
+            }
+        }
     }
 
-    cfg.active = Some(name.to_string());
+    if !dry_run {
+        cfg.active = Some(name.to_string());
+        config::save(&cfg)?;
+        println!("\n{} active profile is now {}", "✓".green().bold(), name.cyan().bold());
+        run_hooks(&hooks);
+    } else {
+        println!("\n{}", "no changes made".dimmed());
+    }
+
+    Ok(())
+}
+
+pub fn restore(dry_run: bool) -> anyhow::Result<()> {
+    let mut cfg = config::load()?;
+
+    let name = cfg
+        .active
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no active profile"))?;
+
+    let entries = cfg
+        .profiles
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("active profile \"{}\" not found in config", name))?
+        .clone();
+
+    if dry_run {
+        println!("{} {}\n", "Dry run — restore".bold(), name.cyan().bold());
+    } else {
+        println!("{} {}\n", "Restoring profile".bold(), name.cyan().bold());
+    }
+
+    for entry in &entries {
+        let original = PathBuf::from(&entry.original);
+        let stored = stored_path(&name, &entry.alias);
+
+        let is_symlink = original.symlink_metadata().is_ok() && original.symlink_metadata().unwrap().file_type().is_symlink();
+
+        if !is_symlink && original.exists() {
+            println!("  {} {} is not a symlink, skipping", "⚠".yellow(), entry.alias.cyan());
+            continue;
+        }
+
+        println!(
+            "  {} {} {} {}",
+            "←".blue(),
+            original.display(),
+            "←".dimmed(),
+            entry.alias.cyan()
+        );
+
+        if dry_run {
+            continue;
+        }
+
+        if original.symlink_metadata().is_ok() {
+            fs::remove_file(&original)?;
+        }
+
+        if let Some(parent) = original.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::copy(&stored, &original)?;
+    }
+
+    if !dry_run {
+        cfg.active = None;
+        config::save(&cfg)?;
+        println!("\n{} restored {} file(s), no active profile", "✓".green().bold(), entries.len());
+    } else {
+        println!("\n{}", "no changes made".dimmed());
+    }
+
+    Ok(())
+}
+
+pub fn copy(from: &str, to: &str) -> anyhow::Result<()> {
+    let mut cfg = config::load()?;
+
+    if !cfg.profiles.contains_key(from) {
+        anyhow::bail!("no profile named \"{}\"", from);
+    }
+    if cfg.profiles.contains_key(to) {
+        anyhow::bail!("profile \"{}\" already exists", to);
+    }
+
+    let entries = cfg.profiles.get(from).unwrap().clone();
+    let hooks = cfg.hooks.get(from).cloned();
+
+    let src_dir = config::profiles_dir().join(from);
+    let dst_dir = config::profiles_dir().join(to);
+    fs::create_dir_all(&dst_dir)?;
+
+    let mut new_entries: Vec<ProfileEntry> = Vec::new();
+    for entry in &entries {
+        let src_file = src_dir.join(&entry.alias);
+        let dst_file = dst_dir.join(&entry.alias);
+        if src_file.exists() {
+            fs::copy(&src_file, &dst_file)?;
+        }
+        new_entries.push(ProfileEntry {
+            original: entry.original.clone(),
+            alias: entry.alias.clone(),
+        });
+    }
+
+    cfg.profiles.insert(to.to_string(), new_entries);
+    if let Some(h) = hooks {
+        cfg.hooks.insert(to.to_string(), h);
+    }
     config::save(&cfg)?;
 
-    println!("\n{} active profile is now {}", "✓".green().bold(), name.cyan().bold());
+    println!(
+        "{} copied {} to {}",
+        "✓".green().bold(),
+        from.cyan().bold(),
+        to.cyan().bold()
+    );
+    Ok(())
+}
 
-    run_hooks(&hooks);
+pub fn export(name: &str, path: &str) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+
+    let entries = cfg
+        .profiles
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("no profile named \"{}\"", name))?;
+
+    let hooks = cfg.hooks.get(name).cloned().unwrap_or_default();
+
+    let out_path = PathBuf::from(path);
+    let file = fs::File::create(&out_path)?;
+    let enc = GzEncoder::new(file, Compression::default());
+    let mut tar = tar::Builder::new(enc);
+
+    for entry in entries {
+        let stored = stored_path(name, &entry.alias);
+        if stored.exists() {
+            tar.append_path_with_name(&stored, &entry.alias)?;
+        }
+    }
+
+    let export_cfg = Config {
+        active: None,
+        profiles: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(name.to_string(), entries.clone());
+            m
+        },
+        hooks: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(name.to_string(), hooks);
+            m
+        },
+    };
+
+    let cfg_toml = toml::to_string_pretty(&export_cfg)?;
+    let cfg_bytes = cfg_toml.as_bytes();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(cfg_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "profile.toml", cfg_bytes)?;
+
+    tar.finish()?;
+
+    println!(
+        "{} exported {} to {}",
+        "✓".green().bold(),
+        name.cyan().bold(),
+        out_path.display().to_string().dimmed()
+    );
+    Ok(())
+}
+
+pub fn import(path: &str) -> anyhow::Result<()> {
+    let mut cfg = config::load()?;
+
+    let file = fs::File::open(path)?;
+    let dec = GzDecoder::new(file);
+    let mut archive = Archive::new(dec);
+
+    let tmp_dir = config::config_dir().join("import_tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    archive.unpack(&tmp_dir)?;
+
+    let profile_toml = tmp_dir.join("profile.toml");
+    let text = fs::read_to_string(&profile_toml)?;
+    let import_cfg: Config = toml::from_str(&text)?;
+
+    for (name, entries) in &import_cfg.profiles {
+        if cfg.profiles.contains_key(name) {
+            anyhow::bail!("profile \"{}\" already exists", name);
+        }
+
+        let dest_dir = config::profiles_dir().join(name);
+        fs::create_dir_all(&dest_dir)?;
+
+        for entry in entries {
+            let src = tmp_dir.join(&entry.alias);
+            let dst = dest_dir.join(&entry.alias);
+            if src.exists() {
+                fs::copy(&src, &dst)?;
+            }
+        }
+
+        cfg.profiles.insert(name.clone(), entries.clone());
+        if let Some(hooks) = import_cfg.hooks.get(name) {
+            cfg.hooks.insert(name.clone(), hooks.clone());
+        }
+
+        println!("{} imported profile {}", "✓".green().bold(), name.cyan().bold());
+    }
+
+    config::save(&cfg)?;
+    fs::remove_dir_all(&tmp_dir)?;
 
     Ok(())
 }
