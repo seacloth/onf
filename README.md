@@ -13,9 +13,7 @@ onf is a minimal configuration switcher written in Rust.
 ### install
 
 ```bash
-git clone https://github.com/seacloth/onf
-cd onf
-cargo install --path .
+cargo install onf
 ```
 
 ---
